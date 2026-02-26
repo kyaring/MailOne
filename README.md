@@ -54,25 +54,65 @@ MailOne/
 
 ---
 
-## 部署步骤
+## 部署步骤（推荐：GitHub Actions 自动部署）
 
-1. 创建 D1 数据库
-2. 在 `wrangler.toml` 填入真实 `database_id`
-3. 执行建表
+仓库已内置工作流：`.github/workflows/deploy.yml`。
 
-```bash
-wrangler d1 execute mailone --file=./schema.sql
-```
+### 1）准备 GitHub Secrets / Variables
 
+在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加：
+
+- `CLOUDFLARE_API_TOKEN`（需包含 Workers + D1 读写权限）
+- `CLOUDFLARE_ACCOUNT_ID`
+
+可选变量：
+
+- `AUTO_DEPLOY=true`（默认即为 true；设为 false 可关闭 push 自动部署）
+
+### 2）首次部署（init）
+
+在 GitHub Actions 页面手动运行 `Deploy MailOne [Cloudflare Worker + D1]`，参数：
+
+- `deploy_action = init`
+- `apply_schema = true`（或 `auto`）
+
+init 会自动执行：
+
+1. 检查/创建 D1 数据库 `mailone`
+2. 自动写入 `wrangler.toml` 中的 `database_id`
+3. 执行 `schema.sql`
 4. 部署 Worker
 
+### 3）后续更新（update）
+
+- 直接 push 到 `main/master`（修改 `src/**`、`schema.sql` 或 `wrangler.toml`）即可自动部署
+- 也可手动触发，`deploy_action = update`
+
+`apply_schema=auto` 时，仅在 `schema.sql` 变更时执行建表 SQL。
+
+### 4）Cloudflare 邮件路由配置（必须）
+
+Cloudflare Dashboard → Email Routing：
+
+- 开启 Email Routing
+- 将域名 Catch-all 路由到本 Worker（`mailone`）
+
+完成后即可通过 API 查询邮箱最新邮件。
+
+---
+
+## 手动部署（备用）
+
 ```bash
+# 1) 创建 D1（首次）
+wrangler d1 create mailone
+
+# 2) 执行建表
+wrangler d1 execute mailone --remote --file=./schema.sql
+
+# 3) 部署 Worker
 wrangler deploy
 ```
-
-5. Cloudflare Dashboard → Email Routing
-   - 开启 Email Routing
-   - 将域名的 Catch-all 路由到本 Worker
 
 ---
 
