@@ -1,0 +1,269 @@
+name: Deploy MailOne [Cloudflare Worker + D1]
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "schema.sql"
+      - "wrangler.toml"
+  workflow_dispatch:
+    inputs:
+      deploy_action:
+        description: "部署动作：update（常规更新）/ init（首次部署，创建 D1 + 建表 + 部署）"
+        required: false
+        default: "update"
+        type: choice
+        options:
+          - update
+          - init
+      apply_schema:
+        description: "执行建表 SQL：true / false / auto（auto 仅在 schema.sql 变更时执行）"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - "true"
+          - "false"
+  repository_dispatch:
+    types: [deploy-mailone]
+
+env:
+  WORKER_NAME: mailone
+  D1_DATABASE_NAME: mailone
+
+jobs:
+  check-config:
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      deploy_action: ${{ steps.plan.outputs.deploy_action }}
+      should_apply_schema: ${{ steps.plan.outputs.should_apply_schema }}
+      src_changed: ${{ steps.changes.outputs.src_changed }}
+      schema_changed: ${{ steps.changes.outputs.schema_changed }}
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 检查部署开关
+        id: check
+        run: |
+          # 手动触发和外部调用始终允许部署
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ 非 push 触发，允许部署"
+            exit 0
+          fi
+
+          ENABLED="${{ vars.AUTO_DEPLOY }}"
+          [ -z "$ENABLED" ] && ENABLED="true"
+
+          if [ "$ENABLED" = "true" ]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ 自动部署已开启"
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "⏸️ 自动部署已关闭（设置 AUTO_DEPLOY=true 以启用）"
+          fi
+
+      - name: 🔎 检测变更范围
+        id: changes
+        run: |
+          echo "src_changed=false" >> $GITHUB_OUTPUT
+          echo "schema_changed=false" >> $GITHUB_OUTPUT
+
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            # 非 push 触发，视为全量变更
+            echo "src_changed=true" >> $GITHUB_OUTPUT
+            echo "schema_changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          before="${{ github.event.before }}"
+          if [[ -z "$before" || "$before" == "0000000000000000000000000000000000000000" ]]; then
+            echo "src_changed=true" >> $GITHUB_OUTPUT
+            echo "schema_changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            echo "⚠️ before 提交不可达，视为全量变更"
+            echo "src_changed=true" >> $GITHUB_OUTPUT
+            echo "schema_changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$before" "${{ github.sha }}")
+
+          if echo "$CHANGED" | grep -qE "^(src/|wrangler\.toml)"; then
+            echo "src_changed=true" >> $GITHUB_OUTPUT
+          fi
+          if echo "$CHANGED" | grep -q "^schema.sql"; then
+            echo "schema_changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🧭 生成部署计划
+        id: plan
+        run: |
+          deploy_action="${{ github.event.inputs.deploy_action }}"
+          apply_schema="${{ github.event.inputs.apply_schema }}"
+
+          # repository_dispatch 支持 payload 传参
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            [ -n "${{ github.event.client_payload.deploy_action }}" ] && deploy_action="${{ github.event.client_payload.deploy_action }}"
+            [ -n "${{ github.event.client_payload.apply_schema }}" ] && apply_schema="${{ github.event.client_payload.apply_schema }}"
+          fi
+
+          [ -z "$deploy_action" ] && deploy_action="update"
+          [ -z "$apply_schema" ] && apply_schema="auto"
+
+          # init 模式强制建表
+          if [[ "$deploy_action" == "init" ]]; then
+            apply_schema="true"
+          fi
+
+          should_apply_schema="false"
+          if [[ "$apply_schema" == "true" ]]; then
+            should_apply_schema="true"
+          elif [[ "$apply_schema" == "auto" && "${{ steps.changes.outputs.schema_changed }}" == "true" ]]; then
+            should_apply_schema="true"
+          fi
+
+          echo "deploy_action=$deploy_action" >> $GITHUB_OUTPUT
+          echo "should_apply_schema=$should_apply_schema" >> $GITHUB_OUTPUT
+
+          echo "📋 部署计划："
+          echo "  动作: $deploy_action"
+          echo "  建表: $should_apply_schema"
+          echo "  源码变更: ${{ steps.changes.outputs.src_changed }}"
+          echo "  Schema变更: ${{ steps.changes.outputs.schema_changed }}"
+
+  deploy:
+    needs: check-config
+    if: needs.check-config.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 📦 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 📦 安装 wrangler
+        run: npm install -g wrangler
+
+      - name: 🔇 关闭 wrangler 遥测
+        run: wrangler telemetry disable
+
+      - name: 🔍 检查 D1 数据库
+        id: check-db
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "检查 D1 数据库是否存在..."
+          DATABASE_LIST=$(wrangler d1 list --json 2>/dev/null || echo "[]")
+          EXISTING_DB=$(echo "$DATABASE_LIST" | jq -r '.[] | select(.name=="${{ env.D1_DATABASE_NAME }}") | .uuid')
+
+          if [ -n "$EXISTING_DB" ]; then
+            echo "db_exists=true" >> $GITHUB_OUTPUT
+            echo "database_id=$EXISTING_DB" >> $GITHUB_OUTPUT
+            echo "✅ 找到现有 D1 数据库: $EXISTING_DB"
+          else
+            echo "db_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ D1 数据库不存在"
+          fi
+
+      - name: 🆕 创建 D1 数据库（首次部署）
+        id: create-db
+        if: steps.check-db.outputs.db_exists != 'true' && needs.check-config.outputs.deploy_action == 'init'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "创建 D1 数据库..."
+          CREATE_OUTPUT=$(wrangler d1 create ${{ env.D1_DATABASE_NAME }} 2>&1)
+          echo "$CREATE_OUTPUT"
+
+          DATABASE_ID=$(echo "$CREATE_OUTPUT" | grep -oP '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+
+          if [ -z "$DATABASE_ID" ]; then
+            echo "❌ 无法创建 D1 数据库"
+            exit 1
+          fi
+
+          echo "database_id=$DATABASE_ID" >> $GITHUB_OUTPUT
+          echo "✅ D1 数据库已创建: $DATABASE_ID"
+
+      - name: ❌ 数据库不存在且非 init 模式
+        if: steps.check-db.outputs.db_exists != 'true' && needs.check-config.outputs.deploy_action != 'init'
+        run: |
+          echo "❌ D1 数据库不存在，请使用 init 模式首次部署"
+          echo "   在 Actions 页面手动触发，选择 deploy_action = init"
+          exit 1
+
+      - name: 📝 写入 database_id 到 wrangler.toml
+        run: |
+          # 优先用已有的，其次用新建的
+          DB_ID="${{ steps.check-db.outputs.database_id }}"
+          [ -z "$DB_ID" ] && DB_ID="${{ steps.create-db.outputs.database_id }}"
+
+          if [ -z "$DB_ID" ]; then
+            echo "❌ 无法获取 database_id"
+            exit 1
+          fi
+
+          sed -i "s/YOUR_D1_DATABASE_ID/$DB_ID/g" wrangler.toml
+          sed -i -E "s/(database_id = \")([^\"]+)(\")/\1$DB_ID\3/" wrangler.toml
+          echo "✅ wrangler.toml 已更新 database_id = $DB_ID"
+          cat wrangler.toml
+
+      - name: 🗃️ 执行建表 SQL
+        if: needs.check-config.outputs.should_apply_schema == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "执行 schema.sql..."
+          wrangler d1 execute ${{ env.D1_DATABASE_NAME }} --remote --file=./schema.sql
+          echo "✅ 建表完成"
+
+      - name: 🚀 部署 Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "部署 Worker..."
+          wrangler deploy
+          echo "✅ Worker 部署成功"
+
+      - name: 📊 部署结果
+        if: always()
+        run: |
+          echo "===================================================="
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "🎉 MailOne 部署成功！"
+            echo "===================================================="
+            echo ""
+            echo "📮 API 地址: https://${{ env.WORKER_NAME }}.<your-subdomain>.workers.dev"
+            echo "📧 收件域名: 需在 Cloudflare Email Routing 中配置 Catch-all"
+            echo ""
+            echo "使用示例:"
+            echo "  curl \"https://${{ env.WORKER_NAME }}.<your-subdomain>.workers.dev/?to=test@your-domain.com\""
+            echo ""
+            if [[ "${{ needs.check-config.outputs.deploy_action }}" == "init" ]]; then
+              echo "⚠️  首次部署后续步骤："
+              echo "  1. Cloudflare Dashboard → 域名 → Email → Email Routing"
+              echo "  2. 开启 Email Routing"
+              echo "  3. Catch-all → 路由到 Worker 'mailone'"
+            fi
+          else
+            echo "❌ MailOne 部署失败！请检查日志"
+          fi
+          echo "===================================================="
